@@ -309,6 +309,10 @@ closeFileDurableAtomic tmpFilePath filePath dirFd@(Fd cDirFd) fileHandle = do
            fsyncFileDescriptor "closeFileDurableAtomic/Directory" cDirFd)
       (closeDirectory dirFd)
   where
+    -- FIXME: Renamed source and destination files must both have absolute
+    -- paths, if any one of them is relative, then both must be located in the
+    -- `dirFd` and the ones that are relative, must have file names relative to
+    -- the `dirFd`, i.e. have the prefix relative path stripped. This is the cause of rio#160
     renameFile tmpFp origFp =
       void $
       throwErrnoIfMinus1Retry "closeFileDurableAtomic - renameFile" $
@@ -461,13 +465,22 @@ withBinaryFileDurableAtomic absFp iomode cb = do
         -- copy original file for read purposes
         fileExists <- doesFileExist absFp
         tmpFp <- toTmpFilePath absFp
+        -- FIXME: Possible race condition: between `doesFileExist` and `when
+        -- fileExists` could be removed, which would result in a runtime
+        -- exception, but should be ignored instead and write file operation
+        -- should start with an empty file
         when fileExists $ copyFile absFp tmpFp
+        -- FIXME: exception here will simply leave a copy of a file dangling
 
         withDurableAtomic tmpFp run
   where
     withDurableAtomic tmpFp run = do
       bracket
         (openFileAndDirectory tmpFp iomode)
-        (uncurry $ closeFileDurableAtomic tmpFp absFp)
+        (uncurry $ closeFileDurableAtomic tmpFp absFp
+         -- FIXME: An exception in `cb` would cause a corrupt file getting
+         -- atomically renamed here
+         -- FIXME: An exception here would cause a temporary file be left dangling
+        )
         (run . cb . snd)
 #endif
