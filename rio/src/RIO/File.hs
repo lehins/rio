@@ -444,12 +444,12 @@ withBinaryFileAtomicRename onFileHandleBefore onDirFdAfter filePath iomode cb =
 --
 -- @since 0.1.6
 ensureFileDurable :: MonadIO m => FilePath -> m ()
-ensureFileDurable absFp =
+ensureFileDurable fp =
 #if WINDOWS
-  absFp `seq` return ()
+  fp `seq` return ()
 #else
   liftIO $
-  bracket (openFileAndDirectory absFp ReadMode)
+  bracket (openFileAndDirectory fp ReadMode)
           (uncurry closeFileDurable)
           (const $ return ())
 #endif
