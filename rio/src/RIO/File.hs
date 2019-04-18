@@ -203,6 +203,8 @@ openFileFromDir (Fd dirFd) fp iomode =
   withFilePath fp $ \f -> do
     bracketOnError
       (do fileFd <- throwErrnoIfMinus1Retry "openFileFromDir" $
+                      -- FIXME: `openat` requires for the file path to be
+                      -- relative to the directory if the file path is not absolute.
                       c_safe_openat dirFd f (ioModeToFlags iomode)
                                             0o666 {- Can open directory with read only -}
           FD.mkFD
@@ -262,6 +264,10 @@ buildTemporaryFilePath filePath = liftIO $ do
   let
     dirFp  = takeDirectory filePath
     fileFp = takeFileName filePath
+  -- FIXME: By using a temporary file on the file system we are not protecting
+  -- ourselves from other processes ability to remove the file from under our
+  -- feet. Using `O_TMPFILE` when opening and `linkat` instead of renaming would
+  -- be a better solution. Thanks Niklas for suggestion.
   bracket (openBinaryTempFile dirFp fileFp)
           (hClose . snd)
           (return . fst)
@@ -469,6 +475,9 @@ withBinaryFileDurableAtomic absFp iomode cb = do
         -- fileExists` could be removed, which would result in a runtime
         -- exception, but should be ignored instead and write file operation
         -- should start with an empty file
+
+        -- FIXME: Because copyFile closes the handle, fsync no longer guarantees
+        -- that the copied data will be durable
         when fileExists $ copyFile absFp tmpFp
         -- FIXME: exception here will simply leave a copy of a file dangling
 
