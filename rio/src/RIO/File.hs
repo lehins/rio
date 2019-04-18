@@ -128,13 +128,13 @@ foreign import ccall unsafe "HsBase.h __hscore_o_noctty" o_NOCTTY :: CInt
 
 -- After here, we have our own imports
 foreign import ccall safe "fcntl.h openat"
-  c_safe_openat :: CInt -> CFilePath -> CInt -> CMode -> IO CInt
+  c_safe_openat :: Fd -> CFilePath -> CInt -> CMode -> IO CInt
 
 foreign import ccall safe "fcntl.h renameat"
-  c_safe_renameat :: CInt -> CFilePath -> CInt -> CFilePath -> IO CInt
+  c_safe_renameat :: Fd -> CFilePath -> Fd -> CFilePath -> IO CInt
 
 foreign import ccall safe "unistd.h fsync"
-  c_safe_fsync :: CInt -> IO CInt
+  c_safe_fsync :: Fd -> IO CInt
 
 std_flags, output_flags, read_flags, write_flags, rw_flags,
     append_flags :: CInt
@@ -187,13 +187,13 @@ closeDirectory (Fd dirFd) =
 fsyncFileDescriptor
   :: MonadIO m
   => String -- ^ Meta-description for error messages
-  -> CInt   -- ^ C File Descriptor
+  -> Fd   -- ^ C File Descriptor
   -> m ()
-fsyncFileDescriptor name cFd =
+fsyncFileDescriptor name fd =
   liftIO $
   void $
     throwErrnoIfMinus1 ("fsync - " <> name) $
-    c_safe_fsync cFd
+    c_safe_fsync fd
 
 -- | Opens a file from a directory, using this function in favour of a regular
 -- 'openFile' guarantees that any file modifications are kept in the same
@@ -204,8 +204,8 @@ fsyncFileDescriptor name cFd =
 -- If you use this function, make sure you are working on an masked state,
 -- otherwise async exceptions may leave file descriptors open.
 --
-openFileFromDir :: (MonadIO m) => Fd -> FilePath -> IOMode -> m Handle
-openFileFromDir (Fd dirFd) (dropDirectoryIfRelative -> fp) iomode =
+openFileFromDir :: MonadIO m => Fd -> FilePath -> IOMode -> m Handle
+openFileFromDir dirFd (dropDirectoryIfRelative -> fp) iomode =
   liftIO $
   withFilePath fp $ \f ->
     bracketOnError
@@ -264,20 +264,22 @@ closeFileDurable :: MonadIO m => Fd -> Handle -> m ()
 closeFileDurable dirFd hdl =
   liftIO $
   finally
-    (do fsyncFileHandle "closeFileDurable" hdl
+    (do fsyncFileHandle "closeFileDurable" Nothing hdl
         -- NOTE: Here we are purposefully not fsyncing the directory if the file fails to fsync
         fsyncDirectoryFd "closeFileDurable" dirFd)
     (closeDirectory dirFd)
 
--- | Call @fsync@ on the file handle and close it.
-fsyncFileHandle :: String -> Handle -> IO ()
-fsyncFileHandle fname hdl = withHandleFd hdl fsyncFD `finally` hClose hdl
-  where fsyncFD fileFd = fsyncFileDescriptor (fname ++ "/File") (FD.fdFD fileFd)
+-- | Optionally set file permissions, call @fsync@ on the file handle and then
+-- close it.
+fsyncFileHandle :: String -> Maybe FileMode -> Handle -> IO ()
+fsyncFileHandle fname mFileMode hdl = withHandleFd hdl fsyncFd `finally` hClose hdl
+  where fsyncFd fd = do
+          forM_ mFileMode (Posix.setFdMode fd)
+          fsyncFileDescriptor (fname ++ "/File") fd
 
 -- | Call @fsync@ on the opened directory file descriptor
 fsyncDirectoryFd :: String -> Fd -> IO ()
-fsyncDirectoryFd fname (Fd cDirFd) =
-  fsyncFileDescriptor (fname ++ "/Directory") cDirFd
+fsyncDirectoryFd fname = fsyncFileDescriptor (fname ++ "/Directory")
 
 buildTemporaryFilePath :: MonadIO m => FilePath -> m FilePath
 buildTemporaryFilePath filePath = liftIO $ do
@@ -354,13 +356,13 @@ copyHandleData hFrom hTo = liftIO $ allocaBytes bufferSize go
         go buffer
 
 
-withHandleFd :: Handle -> (FD.FD -> IO a) -> IO a
+withHandleFd :: Handle -> (Fd -> IO a) -> IO a
 withHandleFd h cb =
   case h of
     HandleFD.FileHandle _ mv ->
       withMVar mv $ \HandleFD.Handle__{HandleFD.haDevice = dev} ->
         case cast dev of
-          Just fd -> cb fd
+          Just fd -> cb $ Fd $ FD.fdFD fd
           Nothing -> error "withHandleFd: not a file handle"
     HandleFD.DuplexHandle {} -> error "withHandleFd: not a file handle"
 
@@ -385,7 +387,7 @@ renameFileAtomic ::
      -- file and the target files are located. In other words atomic rename will
      -- fail if rename happens across different parent directories
      -> m ()
-renameFileAtomic tmpFilePath filePath dirFd@(Fd cDirFd) =
+renameFileAtomic tmpFilePath filePath dirFd =
   liftIO $
       withFilePath (dropDirectoryIfRelative tmpFilePath) $ \tmpFp ->
          withFilePath (dropDirectoryIfRelative filePath) (renameFile tmpFp)
@@ -393,7 +395,7 @@ renameFileAtomic tmpFilePath filePath dirFd@(Fd cDirFd) =
     renameFile tmpFp origFp =
       void $
       throwErrnoIfMinus1Retry "renameFileAtomicWithCallbacks - renameFile" $
-      c_safe_renameat cDirFd tmpFp cDirFd origFp
+      c_safe_renameat dirFd tmpFp dirFd origFp
 
 -- If the `filePath` given is relative, then it is interpreted relative to the directory
 -- referred to by the file descriptor cDirFd (rather than relative to the current working
@@ -420,9 +422,13 @@ withBinaryFileDurableAtomicPosix filePath iomode action =
         -- the directory for durability guarantees
         withDirectory (takeDirectory filePath) $ \dirFd ->
           withFileInDirectory dirFd tmpFilePath iomode $ \tmpFileHandle -> do
-            copyFileHandle iomode filePath tmpFileHandle
+            mFileMode <- copyFileHandle iomode filePath tmpFileHandle
             res <- action tmpFileHandle
-            liftIO $ fsyncFileHandle "withBinaryFileDurableAtomicPosix" tmpFileHandle
+            liftIO $
+              fsyncFileHandle
+                "withBinaryFileDurableAtomicPosix"
+                mFileMode
+                tmpFileHandle
             renameFileAtomic tmpFilePath filePath dirFd
             liftIO $ fsyncDirectoryFd "withBinaryFileDurableAtomic" dirFd
             pure res
