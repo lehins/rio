@@ -278,26 +278,24 @@ openAnonymousTempFile eDir filePath iomode =
         (\(fD, fd_type) ->
            HandleFD.mkHandleFromFD fD fd_type fdName iomode False Nothing)
 
--- Issues discovered with O_TMPFILE
+-- Just some temporary notes. Issues discovered with O_TMPFILE
 --
 --  * `linkat` can only be used for atomic creation of files, since it errors
---  out out existing files. See:
+--  out on existing files. See:
 --  https://stackoverflow.com/questions/29180603/can-hardlinks-be-overwritten-without-using-a-temporary-file
 --  There is no way to remove file and then `linkat` atomically. One workaround
 --  is upon "IOException of type AlreadyExists" when doing `linkat` create an
 --  actual temporary file by `linkat` at that tmp file first and then right away do an
 --  atomic `rename`.
 --
---  * It will not work for durable writes for two resons:
+--  * It should work for durable writes too. Here are some concerns
 --
 --    * It seems that there was a bug of `O_TMPFILE` couldn't be used with
 --    `openat`, which is required for fsync, see:
 --    https://lwn.net/Articles/619146/ But I was successfully able to use it.
 --
---    * We can't atomically replace existing files (see above) with `linkat`,
---    which rules it out doesn't work with existing files
+--    * Do we need to do an extra fsync on intermediate temporary file?
 --
---  *
 -- linkAt :: Handle -> FilePath -> IO CInt
 -- linkAt tmpFileHandle filePath =
 --   withHandleFd tmpFileHandle $ \ fd@(Fd cFd) ->
@@ -556,7 +554,8 @@ dropDirectoryIfRelative fp
   | isRelative fp = takeFileName fp
   | otherwise = fp
 
-
+-- | Old, but arguable more portable way of doing atomic durable writes, since
+-- it doesn't rely on `O_TMPFILE`
 withBinaryFileDurableAtomicPosix' ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
 withBinaryFileDurableAtomicPosix' filePath iomode action =
@@ -600,7 +599,8 @@ withBinaryFileDurableAtomicPosix filePath iomode action =
           pure res
 
 
-
+-- | This version of atomic writes does not utilize file descriptor of the
+-- containing directory. Other than that it is just like `withBinaryFileAtomicPosix`
 withBinaryFileAtomicPosix' ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
 withBinaryFileAtomicPosix' filePath iomode action =
@@ -617,6 +617,11 @@ withBinaryFileAtomicPosix' filePath iomode action =
         liftIO $ atomicTempFileCreate Nothing mFileMode tmpFileHandle filePath
         pure res
 
+-- | Perform all write operations on a temporary file that is invisible to other
+-- processes and then atomically move it into the destination file path. If
+-- previously file existed, it will be overwritten in case of `WriteMode`, but
+-- for others it will have it's contents copied over into the temp file prior to
+-- its modifications.
 withBinaryFileAtomicPosix ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
 withBinaryFileAtomicPosix filePath iomode action =
