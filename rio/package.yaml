@@ -109,6 +109,8 @@ library:
     - RIO.Prelude.Trace
     - RIO.Prelude.URef
 
+  c-sources:           cbits/rio.c
+  cc-options:          -Wall -O2
 tests:
   spec:
     source-dirs: test
