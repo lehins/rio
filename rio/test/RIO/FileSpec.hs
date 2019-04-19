@@ -10,7 +10,7 @@ import UnliftIO.Directory
 
 import RIO
 import qualified RIO.ByteString as BS
-import qualified RIO.File as SUT
+import qualified RIO.File as File
 
 spec :: Spec
 spec = do
@@ -19,51 +19,57 @@ spec = do
       withSystemTempDirectory "rio" $ \dir -> do
         let fp = dir </> "ensure_file_durable"
         writeFileUtf8 fp "Hello World"
-        SUT.ensureFileDurable fp
+        File.ensureFileDurable fp
         contents <- BS.readFile fp
         contents `shouldBe` "Hello World"
+  withBinaryFileSpec "withBinaryFileAtomic" File.withBinaryFileAtomic
+  writeBinaryFileSpec "writeBinaryFileAtomic" File.writeBinaryFileAtomic
+  withBinaryFileSpec "withBinaryFileDurableAtomic" File.withBinaryFileDurableAtomic
+  writeBinaryFileSpec "writeBinaryFileDurableAtomic" File.writeBinaryFileDurableAtomic
 
-  describe "withBinaryFileDurableAtomic" $ do
+withBinaryFileSpec ::
+     String -> (FilePath -> IOMode -> (Handle -> IO ()) -> IO a) -> Spec
+withBinaryFileSpec fname withFileTestable = do
+  let hello = "Hello World"
+      goodbye = "Goodbye World"
+  describe fname $ do
+    it "write" $
+      withSystemTempDirectory "rio" $ \dir -> do
+        let fp = dir </> (fname ++ "-write")
+        withFileTestable fp WriteMode $ \h -> BS.hPut h hello
+        BS.readFile fp `shouldReturn` hello
     it "read/write" $
       withSystemTempDirectory "rio" $ \dir -> do
-        let fp = dir </> "with_file_durable_atomic"
-            hello = "Hello World"
-            goodbye = "Goodbye World"
+        let fp = dir </> (fname ++ "-read-write")
         writeFileUtf8Builder fp $ displayBytesUtf8 hello
-        SUT.withBinaryFileDurableAtomic fp ReadWriteMode $ \h -> do
-          input <- BS.hGetLine h
-          input `shouldBe` hello
+        withFileTestable fp ReadWriteMode $ \h -> do
+          BS.hGetLine h `shouldReturn` hello
           BS.hPut h goodbye
         BS.readFile fp `shouldReturn` (hello <> goodbye)
     it "relative path" $
       withSystemTempDirectory "rio" $ \dir -> do
-        let dir = "with_file_durable_atomic"
-            hello = "Hello World"
-            goodbye = "Goodbye World"
+        let fp = dir </> (fname ++ "-relative-path")
             testWritingInRelativeDir fp = do
               writeFileUtf8Builder fp $ displayBytesUtf8 hello
-              SUT.withBinaryFileDurableAtomic fp ReadWriteMode $ \h -> do
+              withFileTestable fp ReadWriteMode $ \h -> do
                 input <- BS.hGetLine h
                 input `shouldBe` hello
                 BS.hPut h goodbye
               BS.readFile fp `shouldReturn` (hello <> goodbye)
-        bracket (createDirectoryIfMissing True dir >> pure (dir </> "test.file"))
-                (const (removeDirectoryRecursive dir))
-                testWritingInRelativeDir
+        bracket
+          (createDirectoryIfMissing True dir >> pure (dir </> "test.file"))
+          (const (removeDirectoryRecursive dir))
+          testWritingInRelativeDir
 
-  describe "writeBinaryFileDurableAtomic" $
+
+
+writeBinaryFileSpec :: String -> (FilePath -> ByteString -> IO a) -> SpecWith ()
+writeBinaryFileSpec fname writeFileTestable = do
+  let hello = "Hello World"
+  describe fname $ do
     it "write" $
       withSystemTempDirectory "rio" $ \dir -> do
-        let fp = dir </> "with_file_durable_atomic"
-        SUT.writeBinaryFileDurableAtomic fp "Hello World"
-        BS.readFile fp `shouldReturn` "Hello World"
-
-  describe "withBinaryFileDurable" $
-    context "happy path" $
-      it "works the same as withFile" $
-        withSystemTempDirectory "rio" $ \dir -> do
-          let fp = dir </> "with_file_durable"
-          SUT.withBinaryFileDurable fp WriteMode $ \h ->
-            BS.hPut h "Hello World"
-          contents <- BS.readFile fp
-          contents `shouldBe` "Hello World"
+        let fp = dir </> (fname ++ "-write")
+        writeFileTestable fp hello
+        BS.readFile fp `shouldReturn` hello
+    xit "default-permissions" $ () `shouldBe` ()
