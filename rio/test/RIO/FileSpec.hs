@@ -61,33 +61,25 @@ withBinaryFileSpec fname withFileTestable = do
     it "sub-directory" $
       withSystemTempDirectory "rio" $ \dir -> do
         let subDir = dir </> (fname ++ "-sub-directory")
-        let testWritingInRelativeDir fp = do
-              writeFileUtf8Builder fp $ displayBytesUtf8 hello
-              withFileTestable fp ReadWriteMode $ \h -> do
-                input <- BS.hGetLine h
-                input `shouldBe` hello
-                BS.hPut h goodbye
-              BS.readFile fp `shouldReturn` (hello <> goodbye)
-        bracket
-          (createDirectoryIfMissing True subDir >> pure (subDir </> "test.file"))
-          (const (removeDirectoryRecursive dir))
-          testWritingInRelativeDir
+            fp = subDir </> "test.file"
+        createDirectoryIfMissing True subDir
+        writeFileUtf8Builder fp $ displayBytesUtf8 hello
+        withFileTestable fp ReadWriteMode $ \h -> do
+          BS.hGetLine h `shouldReturn` hello
+          BS.hPut h goodbye
+        BS.readFile fp `shouldReturn` (hello <> goodbye)
     it "relative-directory" $
       withSystemTempDirectory "rio" $ \dir -> do
         let relDir = fname ++ "-relative-directory"
             subDir = dir </> relDir
-        let testWritingInRelativeDir fp =
-              withCurrentDirectory dir $ do
-                writeFileUtf8Builder fp $ displayBytesUtf8 hello
-                withFileTestable fp ReadWriteMode $ \h -> do
-                  input <- BS.hGetLine h
-                  input `shouldBe` hello
-                  BS.hPut h goodbye
-                BS.readFile fp `shouldReturn` (hello <> goodbye)
-        bracket
-          (createDirectoryIfMissing True subDir >> pure (relDir </> "test.file"))
-          (const (removeDirectoryRecursive dir))
-          testWritingInRelativeDir
+            fp = relDir </> "test.file"
+        createDirectoryIfMissing True subDir
+        withCurrentDirectory dir $ do
+          writeFileUtf8Builder fp $ displayBytesUtf8 hello
+          withFileTestable fp ReadWriteMode $ \h -> do
+            BS.hGetLine h `shouldReturn` hello
+            BS.hPut h goodbye
+          BS.readFile fp `shouldReturn` (hello <> goodbye)
     it "modified-permissions" $
       withSystemTempDirectory "rio" $ \dir -> do
         let fp = dir </> (fname ++ "-modified-permissions")
