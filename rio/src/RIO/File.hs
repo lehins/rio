@@ -240,40 +240,43 @@ openFileFromDir dirFd (dropDirectoryIfRelative -> fp) iomode =
            Device.setSize fD 0
          HandleFD.mkHandleFromFD fD fd_type fp iomode False Nothing)
 
-
+-- | Open an anonymous temporary file
 openAnonymousTempFile ::
-     MonadIO m => Either Fd FilePath -> IOMode -> m Handle
-openAnonymousTempFile eDir iomode =
+     MonadIO m => Either Fd FilePath -> FilePath -> IOMode -> m Handle
+openAnonymousTempFile eDir filePath iomode =
   liftIO $
   case eDir of
     Left dirFd -> withFilePath "." (openAnonymousWith . c_safe_openat dirFd)
     Right dirFilePath ->
       withFilePath dirFilePath (openAnonymousWith . c_safe_open)
   where
+    fdName = "openAnonymousTempFile - " ++ filePath
     ioModeToTmpFlags :: IOMode -> CInt
-    ioModeToTmpFlags = \case
-      WriteMode -> o_WRONLY
-      ReadWriteMode -> o_RDWR
-      AppendMode -> o_APPEND
-      mode -> error $ "openAnonymousTempFile - Unsupported mode: " ++ show mode
+    ioModeToTmpFlags =
+      \case
+        WriteMode -> o_WRONLY
+        ReadWriteMode -> o_RDWR
+        AppendMode -> o_WRONLY
+        mode ->
+          error $ "openAnonymousTempFile - Unsupported mode: " ++ show mode
     openAnonymousWith fopen =
       bracketOnError
-      (do fileFd <-
-            throwErrnoIfMinus1Retry "openAnonymousTempFile" $
+        (do fileFd <-
+              throwErrnoIfMinus1Retry "openAnonymousTempFile" $
               fopen
-              (o_TMPFILE .|. ioModeToTmpFlags iomode)
-              (s_IRUSR .|. s_IWUSR)
-          FD.mkFD
-            fileFd
-            iomode
-            Nothing {- no stat -}
-            False {- not a socket -}
-            False {- non_blocking -}
-           `onException`
-            c_close fileFd)
-      (liftIO . Device.close . fst)
-      (\(fD, fd_type) ->
-         HandleFD.mkHandleFromFD fD fd_type "openAnonymousTempFile" iomode False Nothing)
+                (o_TMPFILE .|. ioModeToTmpFlags iomode)
+                (s_IRUSR .|. s_IWUSR)
+            FD.mkFD
+              fileFd
+              iomode
+              Nothing {- no stat -}
+              False {- not a socket -}
+              False {- non_blocking -}
+             `onException`
+              c_close fileFd)
+        (liftIO . Device.close . fst)
+        (\(fD, fd_type) ->
+           HandleFD.mkHandleFromFD fD fd_type fdName iomode False Nothing)
 
 -- Issues discovered with O_TMPFILE
 --
@@ -289,29 +292,53 @@ openAnonymousTempFile eDir iomode =
 --
 --    * It seems that there was a bug of `O_TMPFILE` couldn't be used with
 --    `openat`, which is required for fsync, see:
---    https://lwn.net/Articles/619146/ BUt I was successfully able to use it.
+--    https://lwn.net/Articles/619146/ But I was successfully able to use it.
 --
 --    * We can't atomically replace existing files (see above) with `linkat`,
 --    which rules it out doesn't work with existing files
 --
 --  *
-linkAt :: Handle -> FilePath -> IO CInt
-linkAt tmpFileHandle filePath =
-  withHandleFd tmpFileHandle $ \ fd@(Fd cFd) ->
-    withFilePath ("/proc/self/fd/" ++ show cFd) $ \ cFromFilePath ->
-      withFilePath filePath $ \ cToFilePath ->
-        throwErrnoIfMinus1Retry "linkAt" $
-          c_safe_linkat at_FDCWD cFromFilePath at_FDCWD cToFilePath at_SYMLINK_FOLLOW
+-- linkAt :: Handle -> FilePath -> IO CInt
+-- linkAt tmpFileHandle filePath =
+--   withHandleFd tmpFileHandle $ \ fd@(Fd cFd) ->
+--     withFilePath ("/proc/self/fd/" ++ show cFd) $ \ cFromFilePath ->
+--       withFilePath filePath $ \ cToFilePath ->
+--         throwErrnoIfMinus1Retry "linkAt" $
+--           c_safe_linkat at_FDCWD cFromFilePath at_FDCWD cToFilePath at_SYMLINK_FOLLOW
 
-atomicFileCreate :: Handle -> FilePath -> IO ()
-atomicFileCreate tmpFileHandle filePath =
+
+atomicDurableTempFileCreate ::
+     Fd -> Maybe FileMode -> Handle -> FilePath -> IO ()
+atomicDurableTempFileCreate dirFd mFileMode tmpFileHandle filePath = do
+  fsyncFileHandle "atomicDurableTempFileCreate" tmpFileHandle
+  atomicTempFileCreate (Just dirFd) mFileMode tmpFileHandle filePath
+  fsyncDirectoryFd "atomicDurableTempFileCreate" dirFd
+
+
+-- | There will be an attempt to atomically create the temporary file at the
+-- target file path. In case when there is already a file at the target file
+-- path, a new visible temporary file will be created in the same folder and
+-- then atomically renamed into the target file path, replacing any existing
+-- file.
+atomicTempFileCreate ::
+     Maybe Fd
+  -- ^ Possible handle for the directory where the target file is located
+  -> Maybe FileMode
+  -- ^ If file permissions the can also be set.
+  -> Handle
+  -- ^ Handle to the abobymous temporary file created with `o_TMPFILE`
+  -> FilePath
+  -- ^ File path for the target file.
+  -> IO ()
+atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
   withHandleFd tmpFileHandle $ \fd@(Fd cFd) ->
     withFilePath ("/proc/self/fd/" ++ show cFd) $ \cFromFilePath ->
-      withFilePath filePath $ \cToFilePath -> do
+      withFilePath filePathName $ \cToFilePath -> do
+        forM_ mFileMode (Posix.setFdMode fd)
         let safeLink which to =
               throwErrnoIfMinus1Retry
                 ("atomicFileCreate - c_safe_linkat - " ++ which) $
-              c_safe_linkat at_FDCWD cFromFilePath at_FDCWD to at_SYMLINK_FOLLOW
+              c_safe_linkat at_FDCWD cFromFilePath dirFd to at_SYMLINK_FOLLOW
         eExc <-
           tryJust (guard . isAlreadyExistsError) $
           safeLink "anonymous" cToFilePath
@@ -321,12 +348,21 @@ atomicFileCreate tmpFileHandle filePath =
             withBinaryTempFileFor filePath $ \visTmpFileName visTmpFileHandle -> do
               hClose visTmpFileHandle
               removeFile visTmpFileName
-              withFilePath visTmpFileName (safeLink "visible")
-              Posix.rename visTmpFileName filePath
-              -- withFilePath visTmpFileName $ \cVisTmpFile -> do
-              --   safeLink "visible" cVisTmpFile
-              --   throwErrnoIfMinus1Retry ("atomicFileCreate - c_safe_rename") $
-              --     c_safe_rename cVisTmpFile cToFilePath
+              case mDirFd of
+                Nothing -> do
+                  withFilePath visTmpFileName (safeLink "visible")
+                  Posix.rename visTmpFileName filePath
+                Just fd ->
+                  withFilePath (takeFileName visTmpFileName) $ \cVisTmpFile -> do
+                    safeLink "visible" cVisTmpFile
+                    void $ throwErrnoIfMinus1Retry "atomicFileCreate - c_safe_renameat" $
+                      c_safe_renameat fd cVisTmpFile fd cToFilePath
+  hClose tmpFileHandle
+  where
+    (dirFd, filePathName) =
+      case mDirFd of
+        Nothing -> (at_FDCWD, filePath)
+        Just (Fd cDirFd) -> (cDirFd, takeFileName filePath)
 
 
 -- | Opens a file using the openat C low-level API. This approach allows us to
@@ -364,18 +400,17 @@ closeFileDurable :: MonadIO m => Fd -> Handle -> m ()
 closeFileDurable dirFd hdl =
   liftIO $
   finally
-    (do fsyncFileHandle "closeFileDurable" Nothing hdl
+    (do fsyncFileHandle "closeFileDurable" hdl
         -- NOTE: Here we are purposefully not fsyncing the directory if the file fails to fsync
         fsyncDirectoryFd "closeFileDurable" dirFd)
-    (closeDirectory dirFd)
+    (hClose hdl >> closeDirectory dirFd)
 
 -- | Optionally set file permissions, call @fsync@ on the file handle and then
 -- close it.
-fsyncFileHandle :: String -> Maybe FileMode -> Handle -> IO ()
-fsyncFileHandle fname mFileMode hdl = withHandleFd hdl fsyncFd `finally` hClose hdl
-  where fsyncFd fd = do
-          forM_ mFileMode (Posix.setFdMode fd)
-          fsyncFileDescriptor (fname ++ "/File") fd
+fsyncFileHandle :: String -> Handle -> IO ()
+fsyncFileHandle fname hdl = withHandleFd hdl fsyncFd
+  where
+    fsyncFd fd = fsyncFileDescriptor (fname ++ "/File") fd
 
 -- | Call @fsync@ on the opened directory file descriptor
 fsyncDirectoryFd :: String -> Fd -> IO ()
@@ -415,7 +450,7 @@ withBinaryTempFileFor filePath action =
   bracketOnError
     (liftIO (openBinaryTempFile dirPath tmpFileName))
     (\(tmpFilePath, tmpFileHandle) ->
-       liftIO (hClose tmpFileHandle >> tryIO (removeFile tmpFileName)))
+        hClose tmpFileHandle >> liftIO (tryIO (removeFile tmpFileName)))
     (uncurry action)
   where
     dirPath = takeDirectory filePath
@@ -424,19 +459,21 @@ withBinaryTempFileFor filePath action =
 
 withAnonymousBinaryTempFileFor ::
      MonadUnliftIO m
-  => FilePath
-  -- ^ Source file path. It may exist or may not.
+  => Maybe Fd
+  -- ^ It is possible to open the temporary file in the context of a directory,
+  -- in such case supply its file descriptor. i.e. @openat@ will be used instead
+  -- of @open@
+  -> FilePath
+  -- ^ Source file path. The file may exist or may not.
   -> IOMode
   -> (Handle -> m a)
   -> m a
-withAnonymousBinaryTempFileFor filePath iomode =
+withAnonymousBinaryTempFileFor mDirFd filePath iomode =
   bracketOnError
-    (liftIO (openAnonymousTempFile (Right dirPath) iomode))
-    (liftIO . hClose)
+    (openAnonymousTempFile dir filePath iomode)
+    hClose
   where
-    dirPath = takeDirectory filePath
-    fileName = takeFileName filePath
-    tmpFileName = "." <> fileName <> ".tmp"
+    dir = maybe (Right (takeDirectory filePath)) Left mDirFd
 
 -- | Copy the contents of the file into the handle, but only if that file exists
 -- and either `ReadWriteMode` or `AppendMode` is specified. Returned is the file
@@ -451,7 +488,7 @@ copyFileHandle iomode fromFilePath toHandle =
            (do fileStatus <- liftIO $ Posix.getFileStatus fromFilePath
                withBinaryFile fromFilePath ReadMode (`copyHandleData` toHandle)
                -- rewind to the beginning
-               hSeek toHandle AbsoluteSeek 0
+               unless (iomode == AppendMode) $ hSeek toHandle AbsoluteSeek 0
                pure $ Posix.fileMode fileStatus)
     else pure Nothing
 
@@ -520,9 +557,9 @@ dropDirectoryIfRelative fp
   | otherwise = fp
 
 
-withBinaryFileDurableAtomicPosix ::
+withBinaryFileDurableAtomicPosix' ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileDurableAtomicPosix filePath iomode action =
+withBinaryFileDurableAtomicPosix' filePath iomode action =
   case iomode of
     ReadMode
       -- We do not need to consider an atomic operation when we are in a
@@ -539,18 +576,14 @@ withBinaryFileDurableAtomicPosix filePath iomode action =
             mFileMode <- copyFileHandle iomode filePath tmpFileHandle
             res <- action tmpFileHandle
             liftIO $
-              fsyncFileHandle
-                "withBinaryFileDurableAtomicPosix"
-                mFileMode
-                tmpFileHandle
+              fsyncFileHandle "withBinaryFileDurableAtomicPosix" tmpFileHandle
             renameFileAtomic tmpFilePath filePath dirFd
             liftIO $ fsyncDirectoryFd "withBinaryFileDurableAtomic" dirFd
             pure res
 
-
-withBinaryFileAtomicPosix2 ::
+withBinaryFileDurableAtomicPosix ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileAtomicPosix2 filePath iomode action =
+withBinaryFileDurableAtomicPosix filePath iomode action =
   case iomode of
     ReadMode
       -- We do not need to consider an atomic operation when we are in a
@@ -558,9 +591,30 @@ withBinaryFileAtomicPosix2 filePath iomode action =
      -> withBinaryFile filePath iomode action
     _ {- WriteMode,  ReadWriteMode,  AppendMode -}
      ->
-      withBinaryTempFileFor filePath $ \tmpFilePath tmpFileHandle -> do
+      withDirectory (takeDirectory filePath) $ \dirFd ->
+        withAnonymousBinaryTempFileFor (Just dirFd) filePath iomode $ \tmpFileHandle -> do
+          mFileMode <- copyFileHandle iomode filePath tmpFileHandle
+          res <- action tmpFileHandle
+          liftIO $
+            atomicDurableTempFileCreate dirFd mFileMode tmpFileHandle filePath
+          pure res
+
+
+
+withBinaryFileAtomicPosix' ::
+     MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
+withBinaryFileAtomicPosix' filePath iomode action =
+  case iomode of
+    ReadMode
+      -- We do not need to consider an atomic operation when we are in a
+      -- 'ReadMode', so we can use a regular `withBinaryFile`
+     -> withBinaryFile filePath iomode action
+    _ {- WriteMode,  ReadWriteMode,  AppendMode -}
+     ->
+      withAnonymousBinaryTempFileFor Nothing filePath iomode $ \tmpFileHandle -> do
+        mFileMode <- copyFileHandle iomode filePath tmpFileHandle
         res <- action tmpFileHandle
-        liftIO $ Posix.rename tmpFilePath filePath
+        liftIO $ atomicTempFileCreate Nothing mFileMode tmpFileHandle filePath
         pure res
 
 withBinaryFileAtomicPosix ::
@@ -573,12 +627,12 @@ withBinaryFileAtomicPosix filePath iomode action =
      -> withBinaryFile filePath iomode action
     _ {- WriteMode,  ReadWriteMode,  AppendMode -}
      ->
-      withAnonymousBinaryTempFileFor filePath iomode $ \tmpFileHandle -> do
-        mFileMode <- copyFileHandle iomode filePath tmpFileHandle
-        res <- action tmpFileHandle
-        liftIO $ atomicFileCreate tmpFileHandle filePath
-        hClose tmpFileHandle
-        pure res
+      withDirectory (takeDirectory filePath) $ \dirFd ->
+        withAnonymousBinaryTempFileFor (Just dirFd) filePath iomode $ \tmpFileHandle -> do
+          mFileMode <- copyFileHandle iomode filePath tmpFileHandle
+          res <- action tmpFileHandle
+          liftIO $ atomicTempFileCreate (Just dirFd) mFileMode tmpFileHandle filePath
+          pure res
 
 #endif
 
