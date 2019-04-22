@@ -412,6 +412,8 @@ withBinaryFileDurable absFp iomode cb =
 #if WINDOWS
   withBinaryFile absFp iomode cb
 #else
+  -- FIXME: ReadMode does not require any syncing, as such should be treated
+  -- specially, but it's not.
   withRunInIO $ \run ->
     bracket
       (openFileAndDirectory absFp iomode)
@@ -478,6 +480,9 @@ withBinaryFileDurableAtomic absFp iomode cb = do
 
         -- FIXME: Because copyFile closes the handle, fsync no longer guarantees
         -- that the copied data will be durable
+        --
+        -- FIXME: permissions of the original file are not saved, consequently
+        -- aren't restored after atomic rename
         when fileExists $ copyFile absFp tmpFp
         -- FIXME: exception here will simply leave a copy of a file dangling
 
