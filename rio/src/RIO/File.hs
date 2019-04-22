@@ -99,7 +99,7 @@ import qualified GHC.IO.FD as FD
 import qualified GHC.IO.Handle.FD as HandleFD
 import RIO.ByteString (hPut)
 import System.Directory (removeFile)
-import System.FilePath (isRelative, takeDirectory, takeFileName, (</>))
+import System.FilePath (isRelative, takeDirectory, takeFileName)
 import System.IO (SeekMode(..), hGetBuf, hPutBuf, openBinaryTempFile)
 import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import qualified System.Posix.Files as Posix
@@ -197,6 +197,17 @@ fsyncFileDescriptor name fd =
     throwErrnoIfMinus1 ("fsync - " <> name) $
     c_safe_fsync fd
 
+-- | Optionally set file permissions, call @fsync@ on the file handle and then
+-- close it.
+fsyncFileHandle :: String -> Handle -> IO ()
+fsyncFileHandle fname hdl = withHandleFd hdl (fsyncFileDescriptor (fname ++ "/File"))
+
+
+-- | Call @fsync@ on the opened directory file descriptor
+fsyncDirectoryFd :: String -> Fd -> IO ()
+fsyncDirectoryFd fname = fsyncFileDescriptor (fname ++ "/Directory")
+
+
 -- | Opens a file from a directory, using this function in favour of a regular
 -- 'openFile' guarantees that any file modifications are kept in the same
 -- directory where the file was opened. An edge case scenario is a mount
@@ -229,6 +240,14 @@ openFileFromDir dirFd (dropDirectoryIfRelative -> fp) iomode =
          when (iomode == WriteMode && fd_type == RegularFile) $
            Device.setSize fD 0
          HandleFD.mkHandleFromFD fD fd_type fp iomode False Nothing)
+
+-- If the `filePath` given is relative, then it is interpreted relative to the directory
+-- referred to by the file descriptor cDirFd (rather than relative to the current working
+-- directory). See `man renameat` for more info.
+dropDirectoryIfRelative :: FilePath -> FilePath
+dropDirectoryIfRelative fp
+  | isRelative fp = takeFileName fp
+  | otherwise = fp
 
 -- | Open an anonymous temporary file
 openAnonymousTempFile ::
@@ -273,26 +292,41 @@ atomicDurableTempFileCreate ::
      Fd -> Maybe FileMode -> Handle -> FilePath -> IO ()
 atomicDurableTempFileCreate dirFd mFileMode tmpFileHandle filePath = do
   fsyncFileHandle "atomicDurableTempFileCreate" tmpFileHandle
+  -- at this point we know that the content has been persisted to the storage it
+  -- is safe to do the atomic move/replace
   atomicTempFileCreate (Just dirFd) mFileMode tmpFileHandle filePath
+  -- Important to close the handle, so the we can fsync the directory
+  hClose tmpFileHandle
+  -- file path is updated, now we can fsync the directory
   fsyncDirectoryFd "atomicDurableTempFileCreate" dirFd
 
 
--- | There will be an attempt to atomically create the temporary file at the
--- target file path. In case when there is already a file at the target file
--- path, a new visible temporary file will be created in the same folder and
--- then atomically renamed into the target file path, replacing any existing
--- file.
+-- | There will be an attempt to atomically convert an invisible temporary file
+-- into a target file at the supplied file path. In case when there is already a
+-- file at that file path, a new visible temporary file will be created in the
+-- same folder and then atomically renamed into the target file path, replacing
+-- any existing file. This is necessary since `c_safe_linkat` cannot replace
+-- files atomically and we have to fall back onto `c_safe_renameat`. This should
+-- not be a problem in practice, since lifetime of such visible file is
+-- extremely short and it will be cleaned up regardless of the outcome of the
+-- rename.
+--
+-- It is important to note, that whenever a file descriptor for the containing
+-- directory is supplied, renaming and linking will be done in it's context,
+-- thus allowing to do proper fsyncing if durability is necessary.
 atomicTempFileCreate ::
      Maybe Fd
   -- ^ Possible handle for the directory where the target file is located
   -> Maybe FileMode
-  -- ^ If file permissions the can also be set.
+  -- ^ If file permissions are supplied they will be set on the new file prior
+  -- to atomic rename.
   -> Handle
-  -- ^ Handle to the abobymous temporary file created with `o_TMPFILE`
+  -- ^ Handle to the anobymous temporary file created with `c_safe_openat` and
+  -- `o_TMPFILE`
   -> FilePath
   -- ^ File path for the target file.
   -> IO ()
-atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
+atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath =
   withHandleFd tmpFileHandle $ \fd@(Fd cFd) ->
     withFilePath ("/proc/self/fd/" ++ show cFd) $ \cFromFilePath ->
       withFilePath filePathName $ \cToFilePath -> do
@@ -322,7 +356,6 @@ atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
                       throwErrnoIfMinus1Retry
                         "atomicFileCreate - c_safe_renameat" $
                       c_safe_renameat dirFd cVisTmpFile dirFd cToFilePath
-  hClose tmpFileHandle
   where
     (cDirFd, filePathName) =
       case mDirFd of
@@ -330,70 +363,13 @@ atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
         Just (Fd cDirFd') -> (cDirFd', takeFileName filePath)
 
 
--- | Opens a file using the openat C low-level API. This approach allows us to
--- get a file descriptor for the directory that contains the file, which we can
--- use later on to fsync the directory with.
---
--- If you use this function, make sure you are working on an masked state,
--- otherwise async exceptions may leave file descriptors open.
-openFileAndDirectory :: MonadIO m => FilePath -> IOMode -> m (Fd, Handle)
-openFileAndDirectory filePath iomode =  liftIO $ do
-  let dir = takeDirectory filePath
-      fp = takeFileName filePath
-
-  bracketOnError (openDir dir) closeDirectory $ \dirFd -> do
-    fileHandle <- openFileFromDir dirFd fp iomode
-    return (dirFd, fileHandle)
-
 withDirectory :: MonadUnliftIO m => FilePath -> (Fd -> m a) -> m a
-withDirectory dirPath = bracketOnError (openDir dirPath) closeDirectory
+withDirectory dirPath = bracket (openDir dirPath) closeDirectory
 
 withFileInDirectory ::
-     MonadUnliftIO m => Fd -> FilePath -> IOMode -> (Handle -> m c) -> m c
+     MonadUnliftIO m => Fd -> FilePath -> IOMode -> (Handle -> m a) -> m a
 withFileInDirectory dirFd filePath iomode =
   bracket (openFileFromDir dirFd filePath iomode) hClose
-
--- | This sub-routine does the following tasks:
---
--- * It calls fsync and then closes the given Handle (mapping to a temporary/backup filepath)
--- * It calls fsync and then closes the containing directory of the file
---
--- These steps guarantee that the file changes are durable.
-closeFileDurable :: MonadIO m => Fd -> Handle -> m ()
-closeFileDurable dirFd hdl =
-  liftIO $
-  finally
-    (do fsyncFileHandle "closeFileDurable" hdl
-        -- NOTE: Here we are purposefully not fsyncing the directory if the file fails to fsync
-        fsyncDirectoryFd "closeFileDurable" dirFd)
-    (hClose hdl >> closeDirectory dirFd)
-
--- | Optionally set file permissions, call @fsync@ on the file handle and then
--- close it.
-fsyncFileHandle :: String -> Handle -> IO ()
-fsyncFileHandle fname hdl = withHandleFd hdl (fsyncFileDescriptor (fname ++ "/File"))
-
-
--- | Call @fsync@ on the opened directory file descriptor
-fsyncDirectoryFd :: String -> Fd -> IO ()
-fsyncDirectoryFd fname = fsyncFileDescriptor (fname ++ "/Directory")
-
-buildTemporaryFilePath :: MonadIO m => FilePath -> m FilePath
-buildTemporaryFilePath filePath = liftIO $ do
-  let
-    dirFp  = takeDirectory filePath
-    fileFp = takeFileName filePath
-  bracket (openBinaryTempFile dirFp fileFp)
-          (hClose . snd)
-          (return . fst)
-
-toTmpFilePath :: MonadIO m => FilePath -> m FilePath
-toTmpFilePath filePath =
-    buildTemporaryFilePath (dirPath </> tmpFilename)
-  where
-    dirPath = takeDirectory filePath
-    filename = takeFileName filePath
-    tmpFilename = "." <> filename <> ".tmp"
 
 
 -- | Create a temporary file for a matching possibly exiting target file that
@@ -431,7 +407,7 @@ withAnonymousBinaryTempFileFor ::
   -> (Handle -> m a)
   -> m a
 withAnonymousBinaryTempFileFor mDirFd filePath iomode =
-  bracketOnError
+  bracket
     (openAnonymousTempFile dir filePath iomode)
     hClose
   where
@@ -470,7 +446,7 @@ copyHandleData hFrom hTo = liftIO $ allocaBytes bufferSize go
         hPutBuf hTo buffer count
         go buffer
 
-
+-- | Thread safe access to the file descriptor in the file handle
 withHandleFd :: Handle -> (Fd -> IO a) -> IO a
 withHandleFd h cb =
   case h of
@@ -481,71 +457,35 @@ withHandleFd h cb =
           Nothing -> error "withHandleFd: not a file handle"
     HandleFD.DuplexHandle {} -> error "withHandleFd: not a file handle"
 
-
--- | This sub-routine does the following tasks:
---
--- * It calls fsync and then closes the given Handle (mapping to a temporary/backup filepath)
--- * It renames the file to the original path (using renameat)
--- * It calls fsync and then closes the containing directory of the file
---
--- These steps guarantee that the file is durable, and that the backup mechanism
--- for catastrophic failure is discarded after no error is thrown.
-renameFileAtomic ::
-     MonadIO m =>
-       FilePath
-     -- ^ Temporary file path for the file to be renamed. Can be relative.
-     -> FilePath
-     -- ^ File path for the target where the temporary file will be renamed
-     -- to. Can be relative.
-     -> Fd
-     -- ^ File descriptor for the directory where both the original temporary
-     -- file and the target files are located. In other words atomic rename will
-     -- fail if rename happens across different parent directories
-     -> m ()
-renameFileAtomic tmpFilePath filePath dirFd =
+-- | See `ensureFileDurable`
+ensureFileDurablePosix :: MonadIO m => FilePath -> m ()
+ensureFileDurablePosix filePath =
   liftIO $
-      withFilePath (dropDirectoryIfRelative tmpFilePath) $ \tmpFp ->
-         withFilePath (dropDirectoryIfRelative filePath) (renameFile tmpFp)
-  where
-    renameFile tmpFp origFp =
-      void $
-      throwErrnoIfMinus1Retry "renameFileAtomicWithCallbacks - renameFile" $
-      c_safe_renameat dirFd tmpFp dirFd origFp
+  withDirectory (takeDirectory filePath) $ \dirFd ->
+    withFileInDirectory dirFd filePath ReadMode (const $ return ())
 
--- If the `filePath` given is relative, then it is interpreted relative to the directory
--- referred to by the file descriptor cDirFd (rather than relative to the current working
--- directory). See `man renameat` for more info.
-dropDirectoryIfRelative :: FilePath -> FilePath
-dropDirectoryIfRelative fp
-  | isRelative fp = takeFileName fp
-  | otherwise = fp
 
--- | Old, but arguable more portable way of doing atomic durable writes, since
--- it doesn't rely on `O_TMPFILE`
-withBinaryFileDurableAtomicPosix' ::
+-- | See `withBinaryFileDurable`
+withBinaryFileDurablePosix ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileDurableAtomicPosix' filePath iomode action =
+withBinaryFileDurablePosix filePath iomode action =
   case iomode of
     ReadMode
-      -- We do not need to consider an atomic operation when we are in a
+      -- We do not need to consider an durable operations when we are in a
       -- 'ReadMode', so we can use a regular `withBinaryFile`
      -> withBinaryFile filePath iomode action
     _ {- WriteMode,  ReadWriteMode,  AppendMode -}
      ->
-      withBinaryTempFileFor filePath $ \tmpFilePath tmpFileHandle' -> do
-        hClose tmpFileHandle'
-        -- We need to close the newly created file, since it must be opened at
-        -- the directory for durability guarantees
-        withDirectory (takeDirectory filePath) $ \dirFd ->
-          withFileInDirectory dirFd tmpFilePath iomode $ \tmpFileHandle -> do
-            _mFileMode <- copyFileHandle iomode filePath tmpFileHandle
-            res <- action tmpFileHandle
-            liftIO $
-              fsyncFileHandle "withBinaryFileDurableAtomicPosix" tmpFileHandle
-            renameFileAtomic tmpFilePath filePath dirFd
-            liftIO $ fsyncDirectoryFd "withBinaryFileDurableAtomic" dirFd
-            pure res
+      withDirectory (takeDirectory filePath) $ \dirFd ->
+        withFileInDirectory dirFd filePath iomode $ \tmpFileHandle -> do
+          res <- action tmpFileHandle
+          liftIO $ do
+            fsyncFileHandle "withBinaryFileDurablePosix" tmpFileHandle
+            -- NOTE: Here we are purposefully not fsyncing the directory if the file fails to fsync
+            fsyncDirectoryFd "withBinaryFileDurablePosix" dirFd
+          pure res
 
+-- | See `withBinaryFileDurableAtomic`
 withBinaryFileDurableAtomicPosix ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
 withBinaryFileDurableAtomicPosix filePath iomode action =
@@ -564,12 +504,10 @@ withBinaryFileDurableAtomicPosix filePath iomode action =
             atomicDurableTempFileCreate dirFd mFileMode tmpFileHandle filePath
           pure res
 
-
--- | This version of atomic writes does not utilize file descriptor of the
--- containing directory. Other than that it is just like `withBinaryFileAtomicPosix`
-withBinaryFileAtomicPosix' ::
+-- | See `withBinaryFileAtomic`
+withBinaryFileAtomicPosix ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileAtomicPosix' filePath iomode action =
+withBinaryFileAtomicPosix filePath iomode action =
   case iomode of
     ReadMode
       -- We do not need to consider an atomic operation when we are in a
@@ -582,28 +520,6 @@ withBinaryFileAtomicPosix' filePath iomode action =
         res <- action tmpFileHandle
         liftIO $ atomicTempFileCreate Nothing mFileMode tmpFileHandle filePath
         pure res
-
--- | Perform all write operations on a temporary file that is invisible to other
--- processes and then atomically move it into the destination file path. If
--- previously file existed, it will be overwritten in case of `WriteMode`, but
--- for others it will have it's contents copied over into the temp file prior to
--- its modifications.
-withBinaryFileAtomicPosix ::
-     MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileAtomicPosix filePath iomode action =
-  case iomode of
-    ReadMode
-      -- We do not need to consider an atomic operation when we are in a
-      -- 'ReadMode', so we can use a regular `withBinaryFile`
-     -> withBinaryFile filePath iomode action
-    _ {- WriteMode,  ReadWriteMode,  AppendMode -}
-     ->
-      withDirectory (takeDirectory filePath) $ \dirFd ->
-        withAnonymousBinaryTempFileFor (Just dirFd) filePath iomode $ \tmpFileHandle -> do
-          mFileMode <- copyFileHandle iomode filePath tmpFileHandle
-          res <- action tmpFileHandle
-          liftIO $ atomicTempFileCreate (Just dirFd) mFileMode tmpFileHandle filePath
-          pure res
 
 #endif
 
@@ -624,15 +540,7 @@ withBinaryFileAtomicPosix filePath iomode action =
 --
 -- @since 0.1.6
 ensureFileDurable :: MonadIO m => FilePath -> m ()
-ensureFileDurable fp =
-#if WINDOWS
-  fp `seq` return ()
-#else
-  liftIO $
-  bracket (openFileAndDirectory fp ReadMode)
-          (uncurry closeFileDurable)
-          (const $ return ())
-#endif
+-- Implementation is at the bottom of the module
 
 
 -- | Similar to 'writeFileBinary', but it also ensures that changes executed to
@@ -645,12 +553,7 @@ ensureFileDurable fp =
 --
 -- @since 0.1.6
 writeBinaryFileDurable :: MonadIO m => FilePath -> ByteString -> m ()
-writeBinaryFileDurable fp bytes =
-#if WINDOWS
-  liftIO $ writeFileBinary fp bytes
-#else
-  liftIO $ withBinaryFileDurable fp WriteMode (liftIO . (`hPut` bytes))
-#endif
+-- Implementation is at the bottom of the module
 
 -- | Similar to 'writeFileBinary', but it also guarantes that changes executed
 -- to the file are durable, also, in case of failure, the modified file is never
@@ -663,12 +566,7 @@ writeBinaryFileDurable fp bytes =
 --
 -- @since 0.1.6
 writeBinaryFileDurableAtomic :: MonadIO m => FilePath -> ByteString -> m ()
-writeBinaryFileDurableAtomic fp bytes =
-#if WINDOWS
-  liftIO $ writeFileBinary fp bytes
-#else
-  liftIO $ withBinaryFileDurableAtomic fp WriteMode (liftIO . (`hPut` bytes))
-#endif
+-- Implementation is at the bottom of the module
 
 -- | Same as 'writeBinaryFileDurableAtomic', except it does not guarantee durability.
 --
@@ -678,12 +576,7 @@ writeBinaryFileDurableAtomic fp bytes =
 --
 -- @since 0.1.10
 writeBinaryFileAtomic :: MonadIO m => FilePath -> ByteString -> m ()
-writeBinaryFileAtomic fp bytes =
-#if WINDOWS
-  liftIO $ writeFileBinary fp bytes
-#else
-  liftIO $ withBinaryFileAtomic fp WriteMode (liftIO . (`hPut` bytes))
-#endif
+-- Implementation is at the bottom of the module
 
 -- | Opens a file with the following guarantees:
 --
@@ -704,16 +597,7 @@ writeBinaryFileAtomic fp bytes =
 -- @since 0.1.6
 withBinaryFileDurable ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileDurable fp iomode cb =
-#if WINDOWS
-  withBinaryFile fp iomode cb
-#else
-  withRunInIO $ \run ->
-    bracket
-      (openFileAndDirectory fp iomode)
-      (uncurry closeFileDurable)
-      (run . cb . snd)
-#endif
+-- Implementation is at the bottom of the module
 
 -- | Opens a file with the following guarantees:
 --
@@ -750,25 +634,54 @@ withBinaryFileDurable fp iomode cb =
 -- @since 0.1.6
 withBinaryFileDurableAtomic ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileDurableAtomic =
-#if WINDOWS
-  withBinaryFile
-#else
-  withBinaryFileDurableAtomicPosix
-#endif
+-- Implementation is at the bottom of the module
 
--- | Just like `withBinaryFileDurableAtomic`, but without the durability
--- part. What it means is that the file can still disappear after it has been
--- succesfully written due to some extreme event like an abrupt power loss, but
--- the contents will not be compromised in case when the file write did not end
--- successfully.
+
+-- | Perform an action on a new or existing file at the destination file path. If
+-- previously the file existed at the supplied file path then:
+--
+-- * in case of `WriteMode` it will be overwritten
+--
+-- * upon `ReadWriteMode` or `AppendMode` files contents will be copied over
+-- into a temporary file, thus making sure no corruption can happen to an
+-- existing file upon any failures, even catastrophic one, yet its contents are
+-- availble for modification.
+--
+-- * There is nothing atomic about `ReadMode`, so no special treatment there.
+--
+-- It is similar to `withBinaryFileDurableAtomic`, but without the durability
+-- part. What it means is that all modification can still disappear after it has
+-- been succesfully written due to some extreme event like an abrupt power loss,
+-- but the contents will not be corrupted in case when the file write did not
+-- end successfully.
 --
 -- @since 0.1.10
 withBinaryFileAtomic ::
      MonadUnliftIO m => FilePath -> IOMode -> (Handle -> m r) -> m r
-withBinaryFileAtomic =
+-- Implementation is at the bottom of the module
+
+
 #if WINDOWS
-  withBinaryFile
+ensureFileDurable = (`seq` pure ())
+
+writeBinaryFileDurable = writeFileBinary
+writeBinaryFileDurableAtomic = writeFileBinary
+writeBinaryFileAtomic = writeFileBinary
+
+withBinaryFileDurable = withBinaryFile
+withBinaryFileDurableAtomic = withBinaryFile
+withBinaryFileAtomic = withBinaryFile
 #else
-  withBinaryFileAtomicPosix
+ensureFileDurable = ensureFileDurablePosix
+
+writeBinaryFileDurable fp bytes =
+  liftIO $ withBinaryFileDurable fp WriteMode (`hPut` bytes)
+writeBinaryFileDurableAtomic fp bytes =
+  liftIO $ withBinaryFileDurableAtomic fp WriteMode (`hPut` bytes)
+writeBinaryFileAtomic fp bytes =
+  liftIO $ withBinaryFileAtomic fp WriteMode (`hPut` bytes)
+
+withBinaryFileDurable = withBinaryFileDurablePosix
+withBinaryFileDurableAtomic = withBinaryFileDurableAtomicPosix
+withBinaryFileAtomic = withBinaryFileAtomicPosix
 #endif

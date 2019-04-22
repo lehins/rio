@@ -37,6 +37,8 @@ spec = do
   -- known good implementations
   withBinaryFileSpec True "withBinaryFileAtomic" File.withBinaryFileAtomic
   writeBinaryFileSpec "writeBinaryFileAtomic" File.writeBinaryFileAtomic
+  withBinaryFileSpec False "withBinaryFileDurable" File.withBinaryFileDurable
+  writeBinaryFileSpec "writeBinaryFileDurable" File.writeBinaryFileDurable
   withBinaryFileSpec True "withBinaryFileDurableAtomic" File.withBinaryFileDurableAtomic
   writeBinaryFileSpec "writeBinaryFileDurableAtomic" File.writeBinaryFileDurableAtomic
 
@@ -48,7 +50,7 @@ withBinaryFileSpec ::
 withBinaryFileSpec atomic fname withFileTestable = do
   let hello = "Hello World"
       writeHello fp = writeFileUtf8Builder fp $ displayBytesUtf8 hello
-      -- Create a file, write "Hello World" into it and apply an action.
+      -- Create a file, write "Hello World" into it and apply the action.
       withHelloFileTestable fp iomode action = do
         writeHello fp
         withFileTestable fp iomode action
@@ -133,7 +135,7 @@ withBinaryFileSpec atomic fname withFileTestable = do
           doesFileExist fp `shouldReturn` False
           listDirectory dir `shouldReturn` []
 
-writeBinaryFileSpec :: String -> (FilePath -> ByteString -> IO a) -> SpecWith ()
+writeBinaryFileSpec :: String -> (FilePath -> ByteString -> IO ()) -> SpecWith ()
 writeBinaryFileSpec fname writeFileTestable = do
   let hello = "Hello World"
       defaultPermissions =
