@@ -203,6 +203,8 @@ openFileFromDir (Fd dirFd) fp iomode =
   withFilePath fp $ \f -> do
     bracketOnError
       (do fileFd <- throwErrnoIfMinus1Retry "openFileFromDir" $
+                      -- FIXME: `openat` requires for the file path to be
+                      -- relative to the directory if the file path is not absolute.
                       c_safe_openat dirFd f (ioModeToFlags iomode)
                                             0o666 {- Can open directory with read only -}
           FD.mkFD
@@ -262,6 +264,10 @@ buildTemporaryFilePath filePath = liftIO $ do
   let
     dirFp  = takeDirectory filePath
     fileFp = takeFileName filePath
+  -- FIXME: By using a temporary file on the file system we are not protecting
+  -- ourselves from other processes ability to remove the file from under our
+  -- feet. Using `O_TMPFILE` when opening and `linkat` instead of renaming would
+  -- be a better solution. Thanks Niklas for suggestion.
   bracket (openBinaryTempFile dirFp fileFp)
           (hClose . snd)
           (return . fst)
@@ -309,6 +315,10 @@ closeFileDurableAtomic tmpFilePath filePath dirFd@(Fd cDirFd) fileHandle = do
            fsyncFileDescriptor "closeFileDurableAtomic/Directory" cDirFd)
       (closeDirectory dirFd)
   where
+    -- FIXME: Renamed source and destination files must both have absolute
+    -- paths, if any one of them is relative, then both must be located in the
+    -- `dirFd` and the ones that are relative, must have file names relative to
+    -- the `dirFd`, i.e. have the prefix relative path stripped. This is the cause of rio#160
     renameFile tmpFp origFp =
       void $
       throwErrnoIfMinus1Retry "closeFileDurableAtomic - renameFile" $
@@ -402,6 +412,8 @@ withBinaryFileDurable absFp iomode cb =
 #if WINDOWS
   withBinaryFile absFp iomode cb
 #else
+  -- FIXME: ReadMode does not require any syncing, as such should be treated
+  -- specially, but it's not.
   withRunInIO $ \run ->
     bracket
       (openFileAndDirectory absFp iomode)
@@ -461,13 +473,28 @@ withBinaryFileDurableAtomic absFp iomode cb = do
         -- copy original file for read purposes
         fileExists <- doesFileExist absFp
         tmpFp <- toTmpFilePath absFp
+        -- FIXME: Possible race condition: between `doesFileExist` and `when
+        -- fileExists` could be removed, which would result in a runtime
+        -- exception, but should be ignored instead and write file operation
+        -- should start with an empty file
+
+        -- FIXME: Because copyFile closes the handle, fsync no longer guarantees
+        -- that the copied data will be durable
+        --
+        -- FIXME: permissions of the original file are not saved, consequently
+        -- aren't restored after atomic rename
         when fileExists $ copyFile absFp tmpFp
+        -- FIXME: exception here will simply leave a copy of a file dangling
 
         withDurableAtomic tmpFp run
   where
     withDurableAtomic tmpFp run = do
       bracket
         (openFileAndDirectory tmpFp iomode)
-        (uncurry $ closeFileDurableAtomic tmpFp absFp)
+        (uncurry $ closeFileDurableAtomic tmpFp absFp
+         -- FIXME: An exception in `cb` would cause a corrupt file getting
+         -- atomically renamed here
+         -- FIXME: An exception here would cause a temporary file be left dangling
+        )
         (run . cb . snd)
 #endif
