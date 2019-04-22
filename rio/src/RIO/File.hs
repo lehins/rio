@@ -1,9 +1,9 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE CPP                      #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
-{-# LANGUAGE NoImplicitPrelude        #-}
-{-# LANGUAGE OverloadedStrings        #-}
-{-# LANGUAGE ViewPatterns             #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ViewPatterns #-}
 {-|
 
 == Rationale
@@ -82,38 +82,33 @@ module RIO.File
   )
   where
 
-import           RIO.Prelude.Reexports
+import RIO.Prelude.Reexports
 
 #ifdef WINDOWS
-import           RIO.Prelude.IO
+import RIO.Prelude.IO
 
 #else
 
-import           RIO.Directory          (doesFileExist)
-import           RIO.ByteString         (hPut)
-import           Data.Bits              ((.|.))
-import           Data.Typeable          (cast)
-import           Foreign                (allocaBytes)
-import           Foreign.C              (CInt (..), throwErrnoIfMinus1,
-                                         throwErrnoIfMinus1Retry)
-import           GHC.IO.Device          (IODeviceType (RegularFile))
-import qualified GHC.IO.Device          as Device
-import qualified GHC.IO.FD              as FD
-import qualified GHC.IO.Handle.FD       as HandleFD
-import           System.Directory       (copyFile, removeFile)
-import           System.FilePath        (isRelative, takeDirectory, takeFileName, (</>))
-import qualified System.Posix.Files     as Posix
-import           System.Posix.Internals (CFilePath, c_close, c_safe_open,
-                                         withFilePath)
-import           System.Posix.Types     (FileMode, CMode (..), Fd (..))
-import           System.IO              (openBinaryTempFile, hPutBuf, hGetBuf, SeekMode(..), print)
-import           System.IO.Error        (isAlreadyExistsError, isDoesNotExistError)
+import Data.Bits ((.|.))
+import Data.Typeable (cast)
+import Foreign (allocaBytes)
+import Foreign.C (CInt(..), throwErrnoIfMinus1, throwErrnoIfMinus1Retry)
+import GHC.IO.Device (IODeviceType(RegularFile))
+import qualified GHC.IO.Device as Device
+import qualified GHC.IO.FD as FD
+import qualified GHC.IO.Handle.FD as HandleFD
+import RIO.ByteString (hPut)
+import System.Directory (removeFile)
+import System.FilePath (isRelative, takeDirectory, takeFileName, (</>))
+import System.IO (SeekMode(..), hGetBuf, hPutBuf, openBinaryTempFile)
+import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
+import qualified System.Posix.Files as Posix
+import System.Posix.Internals (CFilePath, c_close, c_safe_open, withFilePath)
+import System.Posix.Types (CMode(..), Fd(..), FileMode)
 
 #if MIN_VERSION_base(4,9,0)
-import qualified GHC.IO.Handle.Types    as HandleFD (Handle (..), Handle__ (..))
+import qualified GHC.IO.Handle.Types as HandleFD (Handle(..), Handle__(..))
 #endif
-
-import           Debug.Trace
 
 
 -- TODO: Add a ticket/pull request to export this symbols from
@@ -170,8 +165,6 @@ ioModeToFlags iomode =
 --
 -- If you use this function, make sure you are working on a masked state,
 -- otherwise async exceptions may leave file descriptors open.
---
--- @since 0.1.6
 openDir :: MonadIO m => FilePath -> m Fd
 openDir fp
   -- TODO: Investigate what is the situation with Windows FS in regards to non_blocking
@@ -186,8 +179,6 @@ openDir fp
       (c_safe_open cFp (ioModeToFlags ReadMode) 0o660)
 
 -- | Closes a 'Fd' that points to a Directory.
---
--- @since 0.1.6
 closeDirectory :: MonadIO m => Fd -> m ()
 closeDirectory (Fd dirFd) =
   liftIO $
@@ -195,8 +186,6 @@ closeDirectory (Fd dirFd) =
   throwErrnoIfMinus1Retry "closeDirectory" $ c_close dirFd
 
 -- | Executes the low-level C function fsync on a C file descriptor
---
--- @since 0.1.6
 fsyncFileDescriptor
   :: MonadIO m
   => String -- ^ Meta-description for error messages
@@ -279,32 +268,6 @@ openAnonymousTempFile eDir filePath iomode =
         (\(fD, fd_type) ->
            HandleFD.mkHandleFromFD fD fd_type fdName iomode False Nothing)
 
--- Just some temporary notes. Issues discovered with O_TMPFILE
---
---  * `linkat` can only be used for atomic creation of files, since it errors
---  out on existing files. See:
---  https://stackoverflow.com/questions/29180603/can-hardlinks-be-overwritten-without-using-a-temporary-file
---  There is no way to remove file and then `linkat` atomically. One workaround
---  is upon "IOException of type AlreadyExists" when doing `linkat` create an
---  actual temporary file by `linkat` at that tmp file first and then right away do an
---  atomic `rename`.
---
---  * It should work for durable writes too. Here are some concerns
---
---    * It seems that there was a bug of `O_TMPFILE` couldn't be used with
---    `openat`, which is required for fsync, see:
---    https://lwn.net/Articles/619146/ But I was successfully able to use it.
---
---    * Do we need to do an extra fsync on intermediate temporary file?
---
--- linkAt :: Handle -> FilePath -> IO CInt
--- linkAt tmpFileHandle filePath =
---   withHandleFd tmpFileHandle $ \ fd@(Fd cFd) ->
---     withFilePath ("/proc/self/fd/" ++ show cFd) $ \ cFromFilePath ->
---       withFilePath filePath $ \ cToFilePath ->
---         throwErrnoIfMinus1Retry "linkAt" $
---           c_safe_linkat at_FDCWD cFromFilePath at_FDCWD cToFilePath at_SYMLINK_FOLLOW
-
 
 atomicDurableTempFileCreate ::
      Fd -> Maybe FileMode -> Handle -> FilePath -> IO ()
@@ -335,9 +298,10 @@ atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
       withFilePath filePathName $ \cToFilePath -> do
         forM_ mFileMode (Posix.setFdMode fd)
         let safeLink which to =
+              void $
               throwErrnoIfMinus1Retry
                 ("atomicFileCreate - c_safe_linkat - " ++ which) $
-              c_safe_linkat at_FDCWD cFromFilePath dirFd to at_SYMLINK_FOLLOW
+              c_safe_linkat at_FDCWD cFromFilePath cDirFd to at_SYMLINK_FOLLOW
         eExc <-
           tryJust (guard . isAlreadyExistsError) $
           safeLink "anonymous" cToFilePath
@@ -351,17 +315,19 @@ atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
                 Nothing -> do
                   withFilePath visTmpFileName (safeLink "visible")
                   Posix.rename visTmpFileName filePath
-                Just fd ->
+                Just dirFd ->
                   withFilePath (takeFileName visTmpFileName) $ \cVisTmpFile -> do
                     safeLink "visible" cVisTmpFile
-                    void $ throwErrnoIfMinus1Retry "atomicFileCreate - c_safe_renameat" $
-                      c_safe_renameat fd cVisTmpFile fd cToFilePath
+                    void $
+                      throwErrnoIfMinus1Retry
+                        "atomicFileCreate - c_safe_renameat" $
+                      c_safe_renameat dirFd cVisTmpFile dirFd cToFilePath
   hClose tmpFileHandle
   where
-    (dirFd, filePathName) =
+    (cDirFd, filePathName) =
       case mDirFd of
         Nothing -> (at_FDCWD, filePath)
-        Just (Fd cDirFd) -> (cDirFd, takeFileName filePath)
+        Just (Fd cDirFd') -> (cDirFd', takeFileName filePath)
 
 
 -- | Opens a file using the openat C low-level API. This approach allows us to
@@ -370,8 +336,6 @@ atomicTempFileCreate mDirFd mFileMode tmpFileHandle filePath = do
 --
 -- If you use this function, make sure you are working on an masked state,
 -- otherwise async exceptions may leave file descriptors open.
---
--- @since 0.1.6
 openFileAndDirectory :: MonadIO m => FilePath -> IOMode -> m (Fd, Handle)
 openFileAndDirectory filePath iomode =  liftIO $ do
   let dir = takeDirectory filePath
@@ -384,6 +348,8 @@ openFileAndDirectory filePath iomode =  liftIO $ do
 withDirectory :: MonadUnliftIO m => FilePath -> (Fd -> m a) -> m a
 withDirectory dirPath = bracketOnError (openDir dirPath) closeDirectory
 
+withFileInDirectory ::
+     MonadUnliftIO m => Fd -> FilePath -> IOMode -> (Handle -> m c) -> m c
 withFileInDirectory dirFd filePath iomode =
   bracket (openFileFromDir dirFd filePath iomode) hClose
 
@@ -393,8 +359,6 @@ withFileInDirectory dirFd filePath iomode =
 -- * It calls fsync and then closes the containing directory of the file
 --
 -- These steps guarantee that the file changes are durable.
---
--- @since 0.1.6
 closeFileDurable :: MonadIO m => Fd -> Handle -> m ()
 closeFileDurable dirFd hdl =
   liftIO $
@@ -407,9 +371,8 @@ closeFileDurable dirFd hdl =
 -- | Optionally set file permissions, call @fsync@ on the file handle and then
 -- close it.
 fsyncFileHandle :: String -> Handle -> IO ()
-fsyncFileHandle fname hdl = withHandleFd hdl fsyncFd
-  where
-    fsyncFd fd = fsyncFileDescriptor (fname ++ "/File") fd
+fsyncFileHandle fname hdl = withHandleFd hdl (fsyncFileDescriptor (fname ++ "/File"))
+
 
 -- | Call @fsync@ on the opened directory file descriptor
 fsyncDirectoryFd :: String -> Fd -> IO ()
@@ -449,7 +412,7 @@ withBinaryTempFileFor filePath action =
   bracketOnError
     (liftIO (openBinaryTempFile dirPath tmpFileName))
     (\(tmpFilePath, tmpFileHandle) ->
-        hClose tmpFileHandle >> liftIO (tryIO (removeFile tmpFileName)))
+        hClose tmpFileHandle >> liftIO (tryIO (removeFile tmpFilePath)))
     (uncurry action)
   where
     dirPath = takeDirectory filePath
@@ -575,7 +538,7 @@ withBinaryFileDurableAtomicPosix' filePath iomode action =
         -- the directory for durability guarantees
         withDirectory (takeDirectory filePath) $ \dirFd ->
           withFileInDirectory dirFd tmpFilePath iomode $ \tmpFileHandle -> do
-            mFileMode <- copyFileHandle iomode filePath tmpFileHandle
+            _mFileMode <- copyFileHandle iomode filePath tmpFileHandle
             res <- action tmpFileHandle
             liftIO $
               fsyncFileHandle "withBinaryFileDurableAtomicPosix" tmpFileHandle
