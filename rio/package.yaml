@@ -34,16 +34,6 @@ dependencies:
 # Just for preprocessor directives
 - process
 
-when:
-- condition: os(windows)
-  then:
-    cpp-options: -DWINDOWS
-    dependencies:
-    - Win32
-  else:
-    dependencies:
-    - unix
-
 library:
   source-dirs: src/
   exposed-modules:
@@ -109,8 +99,18 @@ library:
     - RIO.Prelude.Trace
     - RIO.Prelude.URef
 
-  c-sources:           cbits/rio.c
-  cc-options:          -Wall -O2
+  when:
+  - condition: os(windows)
+    then:
+      cpp-options: -DWINDOWS
+      dependencies:
+      - Win32
+    else:
+      dependencies:
+      - unix
+      c-sources: cbits/rio.c
+      cc-options: -Wall -O2
+
 tests:
   spec:
     source-dirs: test

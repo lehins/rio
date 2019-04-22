@@ -181,8 +181,9 @@ openDir fp
   liftIO $
   withFilePath fp $ \cFp ->
     Fd <$>
-    (throwErrnoIfMinus1Retry "openDir" $
-     c_safe_open cFp (ioModeToFlags ReadMode) 0o660)
+    throwErrnoIfMinus1Retry
+      "openDir"
+      (c_safe_open cFp (ioModeToFlags ReadMode) 0o660)
 
 -- | Closes a 'Fd' that points to a Directory.
 --
@@ -474,21 +475,23 @@ withAnonymousBinaryTempFileFor mDirFd filePath iomode =
     dir = maybe (Right (takeDirectory filePath)) Left mDirFd
 
 -- | Copy the contents of the file into the handle, but only if that file exists
--- and either `ReadWriteMode` or `AppendMode` is specified. Returned is the file
--- mode of the original file so it can be set later on the copy.
+-- and either `ReadWriteMode` or `AppendMode` is specified. Returned are the
+-- file permissions of the original file so it can be set later when original
+-- gets overwritten atomically.
 copyFileHandle ::
      MonadUnliftIO f => IOMode -> FilePath -> Handle -> f (Maybe FileMode)
 copyFileHandle iomode fromFilePath toHandle =
-  if iomode == ReadWriteMode || iomode == AppendMode
-    -- Make a copy of the source file and its permissions, but only if it exists
-    then either (const Nothing) Just <$>
-         tryJust (guard . isDoesNotExistError)
-           (do fileStatus <- liftIO $ Posix.getFileStatus fromFilePath
-               withBinaryFile fromFilePath ReadMode (`copyHandleData` toHandle)
-               -- rewind to the beginning
-               unless (iomode == AppendMode) $ hSeek toHandle AbsoluteSeek 0
-               pure $ Posix.fileMode fileStatus)
-    else pure Nothing
+  either (const Nothing) Just <$>
+  tryJust
+    (guard . isDoesNotExistError)
+    (do fileStatus <- liftIO $ Posix.getFileStatus fromFilePath
+        -- Whenever we are not overwriting an existing file, we also need a
+        -- copy of the file's contents
+        when (iomode == ReadWriteMode || iomode == AppendMode) $ do
+          withBinaryFile fromFilePath ReadMode (`copyHandleData` toHandle)
+          unless (iomode == AppendMode) $ hSeek toHandle AbsoluteSeek 0
+        -- Get the copy of source file permissions, but only whenever it exists
+        pure $ Posix.fileMode fileStatus)
 
 
 -- This is a copy of the internal function from `directory-1.3.3.2`. It became
