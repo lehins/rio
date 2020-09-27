@@ -824,7 +824,7 @@ noLogging = local (set logFuncL mempty)
 -- function, which can log any message. You determine the log levels
 -- or severity of messages when needed.
 --
--- Using 'RIO.Prelude.mapRIO' and 'contramapGLogFunc' (or
+-- Using 'RIO.mapRIO' and 'contramapGLogFunc' (or
 -- 'contramapMaybeGLogFunc'), you can build hierarchies of loggers.
 --
 -- Example:
